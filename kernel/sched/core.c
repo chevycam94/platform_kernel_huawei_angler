@@ -345,60 +345,6 @@ __read_mostly int scheduler_running;
 int sysctl_sched_rt_runtime = 950000;
 
 /*
- * __task_rq_lock - lock the rq @p resides on.
- */
-static inline struct rq *__task_rq_lock(struct task_struct *p)
-	__acquires(rq->lock)
-{
-	struct rq *rq;
-
-	lockdep_assert_held(&p->pi_lock);
-
-	for (;;) {
-		rq = task_rq(p);
-		raw_spin_lock(&rq->lock);
-		if (likely(rq == task_rq(p)))
-			return rq;
-		raw_spin_unlock(&rq->lock);
-	}
-}
-
-/*
- * task_rq_lock - lock p->pi_lock and lock the rq @p resides on.
- */
-static struct rq *task_rq_lock(struct task_struct *p, unsigned long *flags)
-	__acquires(p->pi_lock)
-	__acquires(rq->lock)
-{
-	struct rq *rq;
-
-	for (;;) {
-		raw_spin_lock_irqsave(&p->pi_lock, *flags);
-		rq = task_rq(p);
-		raw_spin_lock(&rq->lock);
-		if (likely(rq == task_rq(p)))
-			return rq;
-		raw_spin_unlock(&rq->lock);
-		raw_spin_unlock_irqrestore(&p->pi_lock, *flags);
-	}
-}
-
-static void __task_rq_unlock(struct rq *rq)
-	__releases(rq->lock)
-{
-	raw_spin_unlock(&rq->lock);
-}
-
-static inline void
-task_rq_unlock(struct rq *rq, struct task_struct *p, unsigned long *flags)
-	__releases(rq->lock)
-	__releases(p->pi_lock)
-{
-	raw_spin_unlock(&rq->lock);
-	raw_spin_unlock_irqrestore(&p->pi_lock, *flags);
-}
-
-/*
  * this_rq_lock - lock this runqueue and disable interrupts.
  */
 static struct rq *this_rq_lock(void)
@@ -599,6 +545,60 @@ void resched_cpu(int cpu)
 }
 
 #ifdef CONFIG_NO_HZ_COMMON
+
+#ifdef CONFIG_SCHED_HMP
+
+__read_mostly unsigned int sysctl_power_aware_timer_migration;
+
+/* Return first cpu found in shallowest C-state in least power-cost cluster */
+static int _get_nohz_timer_target_hmp(void)
+{
+	int i, best_cpu = smp_processor_id();
+	int min_cost = INT_MAX, min_cstate = INT_MAX;
+
+	if (!sysctl_power_aware_timer_migration)
+		return nr_cpu_ids;
+
+	rcu_read_lock();
+
+	for_each_online_cpu(i) {
+		struct rq *rq = cpu_rq(i);
+		int cpu_cost = power_cost_at_freq(i, rq->max_possible_freq);
+		int cstate = rq->cstate;
+
+		if (power_delta_exceeded(cpu_cost, min_cost)) {
+			if (cpu_cost > min_cost)
+				continue;
+
+			best_cpu = i;
+			min_cost = cpu_cost;
+			min_cstate = cstate;
+			continue;
+		}
+
+		if (cstate < min_cstate) {
+			best_cpu = i;
+			min_cstate = cstate;
+		}
+	}
+	rcu_read_unlock();
+
+	return best_cpu;
+}
+
+#else
+
+static int _get_nohz_timer_target_hmp(void)
+{
+	/*
+	 * sched_enable_hmp = 0 for !CONFIG_SCHED_HMP, which means we should not
+	 * come here for !CONFIG_SCHED_HMP
+	 */
+	return raw_smp_processor_id();
+}
+
+#endif
+
 /*
  * In the semi idle case, use the nearest busy cpu for migrating timers
  * from an idle cpu.  This is good for power-savings.
@@ -610,8 +610,17 @@ void resched_cpu(int cpu)
 int get_nohz_timer_target(void)
 {
 	int cpu = smp_processor_id();
-	int i;
+	int i, lower_power_cpu;
 	struct sched_domain *sd;
+
+	if (sched_enable_hmp) {
+		lower_power_cpu =  _get_nohz_timer_target_hmp();
+		if (lower_power_cpu < nr_cpu_ids)
+			return lower_power_cpu;
+	}
+
+	if (!idle_cpu(cpu))
+		return cpu;
 
 	rcu_read_lock();
 	for_each_domain(cpu, sd) {
@@ -1268,9 +1277,7 @@ static inline u64 scale_exec_time(u64 delta, struct rq *rq)
 	unsigned int cur_freq = rq->cur_freq;
 	int sf;
 
-	if (unlikely(cur_freq > max_possible_freq ||
-		     (cur_freq == rq->max_freq &&
-		      rq->max_freq < rq->max_possible_freq)))
+	if (unlikely(cur_freq > max_possible_freq))
 		cur_freq = rq->max_possible_freq;
 
 	/* round up div64 */
@@ -2372,6 +2379,27 @@ static int compute_load_scale_factor(int cpu)
 	return load_scale;
 }
 
+#define sched_up_down_migrate_auto_update 1
+static void check_for_up_down_migrate_update(const struct cpumask *cpus)
+{
+	int i = cpumask_first(cpus);
+	struct rq *rq = cpu_rq(i);
+
+	if (!sched_up_down_migrate_auto_update)
+		return;
+
+	if (rq->max_possible_capacity == max_possible_capacity)
+		return;
+
+	if (rq->max_possible_freq == rq->max_freq)
+		up_down_migrate_scale_factor = 1024;
+	else
+		up_down_migrate_scale_factor = (1024 * rq->max_possible_freq)/
+					rq->max_freq;
+
+	update_up_down_migrate();
+}
+
 static int cpufreq_notifier_policy(struct notifier_block *nb,
 		unsigned long val, void *data)
 {
@@ -2478,6 +2506,7 @@ static int cpufreq_notifier_policy(struct notifier_block *nb,
 	}
 
 	__update_min_max_capacity();
+	check_for_up_down_migrate_update(policy->related_cpus);
 	post_big_small_task_count_change(cpu_possible_mask);
 
 	return 0;
@@ -2998,6 +3027,8 @@ static int ttwu_remote(struct task_struct *p, int wake_flags)
 
 	rq = __task_rq_lock(p);
 	if (p->on_rq) {
+		/* check_preempt_curr() may use rq clock */
+		update_rq_clock(rq);
 		ttwu_do_wakeup(rq, p, wake_flags);
 		ret = 1;
 	}
